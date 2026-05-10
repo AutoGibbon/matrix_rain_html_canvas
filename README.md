@@ -4,11 +4,11 @@ A WebGL2 matrix rain shader. Built as a Lively Wallpaper background but it's jus
 
 ## what it does
 
-- Discrete trails: each column has trails that arrive on a schedule, traverse the screen, get evicted by the next one. Not a continuous brightness gradient.
+- Discrete trails: each column has trails that arrive on a schedule, traverse the screen, get evicted by the next one.
 - Head flash: white → cyan → green over half a second, decay continues into the cells immediately behind the head so they inherit the colour fade.
 - Body flash: separate ramp, blown-out matrix green driven into bloom for a phosphor-burn look.
 - Dark field: same map sample as the flash gate, opposite end of the range. Some cells go dim instead of bright.
-- Bloom: single-pass cross kernel, weighted by luminance². No render-to-texture nonsense.
+- Bloom: single-pass cross kernel, weighted by luminance². 
 - Resolution-independent: 54 rows at any canvas height, columns scale with aspect ratio.
 - CRT touches: scanlines, slow breathing zoom, per-cell brightness variance.
 
@@ -29,7 +29,7 @@ Drop `rain.html` into Lively Wallpaper as a webpage source. Should work in any o
 
 ## credits
 
-Built iteratively with Claude (Anthropic). I drove the design — analysed the original film footage, set the visual goals, decided what to keep and what to rip out, tuned values to taste. Claude wrote most of the shader code and helped reason through the maths, especially the stateless trail derivation and the flash gating logic. Several rounds of "this looks wrong, why?" went into getting it where it is.
+Built iteratively with Claude. Readme also written by Claude using my direct communication style. I drove the design — analysed the original film footage, set the visual goals, decided what to keep and what to rip out, tuned values to taste. Claude wrote most of the shader code and helped reason through the maths, especially the stateless trail derivation and the flash gating logic. Several rounds of "this looks wrong, why?" went into getting it where it is.
 
 I'm open about AI-assisted work. The aesthetic decisions and architectural calls are mine; the implementation is collaborative.
 
