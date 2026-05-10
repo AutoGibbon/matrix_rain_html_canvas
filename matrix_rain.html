@@ -142,15 +142,18 @@ uniform sampler2D iChannel0; // glyph atlas  (32x32 grid -> 1024 glyphs, shuffle
 
 out vec4 fragColor;
 
-// Resolution-relative cell sizing. REF_CELL is the desired glyph cell size
-// at REF_HEIGHT pixels of canvas height. At any other height, cell size
-// scales proportionally so glyphs occupy the same fraction of the screen.
-// At 4K (2160 tall): cellSize = 40, giving 54 rows. At 1080p: 20px cells,
-// still 54 rows. Column count derives from canvas width / cellSize, so
-// ultrawide displays naturally get more columns.
-#define REF_CELL          40.0    // reference cell size in pixels at REF_HEIGHT
+// Resolution-relative cell sizing. REF_CELL is the desired vertical glyph
+// cell size at REF_HEIGHT pixels of canvas height. At any other height,
+// cell size scales proportionally so glyphs occupy the same fraction of
+// the screen vertically. Horizontal column spacing is squashed by
+// COL_DENSITY so columns can pack tighter than glyphs are tall.
+// At 4K (2160 tall): cellH = 40, cellW = 40 * COL_DENSITY, giving 54 rows.
+// At 1080p: cellH = 20, still 54 rows. Column count derives from
+// canvas width / cellW, so ultrawide displays naturally get more columns.
+#define REF_CELL          40.0    // reference cell size in pixels at REF_HEIGHT (vertical)
 #define REF_HEIGHT        2160.0  // reference canvas height in pixels (4K)
-#define COLOR             vec3(0.1, 1.0, 0.35) // base RGB colour of the rain — tint the whole effect here
+#define COL_DENSITY       0.8    // horizontal column spacing as fraction of vertical cell size — <1.0 packs columns tighter; glyphs render slightly compressed but Katakana/digits handle this fine
+#define COLOR             vec3(0.2, 1.0, 0.50) // base RGB colour of the rain — tint the whole effect here
 
 // --- Trail geometry (foreground layer) --------------------------------------
 // Trails are discrete: a contiguous run of cells that scrolls down a column.
@@ -164,11 +167,11 @@ out vec4 fragColor;
 //   * Body: TRAIL_LEN - FADE_LEN cells of full green, mutating at MUTATE_HZ.
 //   * Tail fade: FADE_LEN cells linearly fading green to black.
 //
-// At 4K, cellSize derives to 40px, giving 54 rows. Trail spans the screen.
+// At 4K, cellH derives to 40px, giving 54 rows. Trail spans the screen.
 #define TRAIL_LEN         54.0    // total trail length in cells (head + body + fade) — ~1 screen height at 4K
 #define TRAIL_LEN_VAR     0.20    // per-trail length jitter as fraction of TRAIL_LEN — 0.20 = ±20% length variation
 #define EVICT_LEN         11.0    // eviction buffer in cells ahead of the head — forced blank, wipes stale state
-#define FADE_LEN          6.0     // tail fade in cells — last N cells of trail fade green to black before evicting
+#define FADE_LEN          3.0     // tail fade in cells — last N cells of trail fade green to black before evicting
 
 // --- Trail scheduling --------------------------------------------------------
 // Trails advance one cell every TRAIL_FRAME_INTERVAL frames at 30fps. Speed
@@ -200,11 +203,11 @@ out vec4 fragColor;
 #define FLASH_HEAD_DECAY    0.35   // head flash decay in seconds — slower than tail
 #define FLASH_PROB          0.12   // fraction of tail mutations that flash
 #define FLASH_MAP_SCROLL    0.25  // flash map vertical scroll in cells/sec — 1 cell per 3s
-#define FLASH_BOOST         3.5    // brightness multiplier at head flash peak
-#define FLASH_BOOST_TAIL    0.6    // brightness multiplier at tail flash peak — was 1.8 when sharing head ramp; raised now that body flashes have their own blown-green ramp
+#define FLASH_BOOST         2.5    // brightness multiplier at head flash peak
+#define FLASH_BOOST_TAIL    1.4    // brightness multiplier at tail flash peak — was 1.8 when sharing head ramp; raised now that body flashes have their own blown-green ramp
 #define FLASH_COLOUR_HOT    vec3(1.0, 1.0, 1.0)
 #define FLASH_COLOUR_MID    vec3(0.55, 1.0, 0.95)
-#define FLASH_BODY_HOT      vec3(0.2, 4.0, 0.7)   // body flash peak — blown-out matrix green for phosphor burn through bloom
+#define FLASH_BODY_HOT      vec3(0.55, 1.0, 0.75)   // body flash peak — blown-out matrix green for phosphor burn through bloom
 
 // --- Dark field --------------------------------------------------------------
 // Inverse of the flash gate, sampled from the *same* mapSample so a single
@@ -214,7 +217,7 @@ out vec4 fragColor;
 // bucket as flashes and decay similarly.
 #define DARK_PROB           0.12   // fraction of tail mutations that dim
 #define DARK_DECAY          0.40   // dim decay in seconds — keep close to FLASH_DECAY for visual parity
-#define DARK_DEPTH          0.75   // brightness multiplier at peak dim — 0 = black, 1 = no effect
+#define DARK_DEPTH          0.65   // brightness multiplier at peak dim — 0 = black, 1 = no effect
 
 // --- Body brightness variance ------------------------------------------------
 // Per-cell stable brightness multiplier applied to body cells. Breaks up the
@@ -229,7 +232,7 @@ out vec4 fragColor;
 // with a soft falloff; dim pixels barely contribute. No render-to-texture,
 // no zoom interaction.
 #define BLOOM_RADIUS        3.0    // sample offset in pixels at REF_HEIGHT — scales with canvas height in main()
-#define BLOOM_STRENGTH      0.35   // contribution of bloom samples added to base
+#define BLOOM_STRENGTH      0.65   // contribution of bloom samples added to base
 
 // --- Layers ------------------------------------------------------------------
 // Two layers now: foreground (depth 1.0) and background (depth 0.6).
@@ -361,13 +364,14 @@ vec4 trailRole(float colIdx, float row, float t, float trailLenScale) {
 // glyph() returns vec4(rgb, alpha) — colour already includes flash ramp +
 // crossfade, alpha is the rendered glyph mask. If the cell is not inside a
 // live trail, returns zero (nothing rendered).
-vec4 glyph(float colIdx, float localX, float fragY, float cellSize, float margin, float trailLenScale) {
+vec4 glyph(float colIdx, float localX, float fragY, float cellW, float cellH, float margin, float trailLenScale) {
   // WebGL's fragCoord.y is 0 at the bottom; we want row 0 at the top so
   // trails advancing to higher row indices fall down the screen.
-  float totalRows = floor(iResolution.y / cellSize);
-  float row = totalRows - 1.0 - floor(fragY / cellSize);
+  float totalRows = floor(iResolution.y / cellH);
+  float row = totalRows - 1.0 - floor(fragY / cellH);
   vec2  cell = vec2(colIdx, row);
-  vec2  uv   = vec2(localX / cellSize, fract(fragY / cellSize));
+  // UV inside the cell: x in [0, 1] across cellW, y in [0, 1] across cellH.
+  vec2  uv   = vec2(localX / cellW, fract(fragY / cellH));
   vec2  fade2 = smoothstep(0.0, margin, uv) * smoothstep(1.0, 1.0 - margin, uv);
   float cellFade = fade2.x * fade2.y;
   uv = uv * 0.75 + 0.125;
@@ -488,13 +492,15 @@ vec4 glyph(float colIdx, float localX, float fragY, float cellSize, float margin
 }
 
 vec4 sampleLayer(vec2 coord, float depth, float margin, float trailLenScale) {
-  // Cell size derived from canvas height so the same number of rows fit at
-  // any resolution. At REF_HEIGHT, cellSize = REF_CELL * depth.
-  float cellSize = REF_CELL * (iResolution.y / REF_HEIGHT) * depth;
-  float c        = floor(coord.x / cellSize);
-  float localX   = coord.x - c * cellSize;
-  float dim      = depth * depth * (depth < 1.0 ? 1.0 : 0.6);
-  vec4  g        = glyph(c, localX, coord.y, cellSize, margin, trailLenScale);
+  // Vertical cell size derived from canvas height so the same row count fits
+  // at any resolution. Horizontal cell size is squashed by COL_DENSITY for
+  // tighter column packing.
+  float cellH = REF_CELL * (iResolution.y / REF_HEIGHT) * depth;
+  float cellW = cellH * COL_DENSITY;
+  float c       = floor(coord.x / cellW);
+  float localX  = coord.x - c * cellW;
+  float dim     = depth * depth * (depth < 1.0 ? 1.0 : 0.6);
+  vec4  g       = glyph(c, localX, coord.y, cellW, cellH, margin, trailLenScale);
   // g.rgb already includes flash colour and tail fade; g.a is glyph mask.
   return vec4(g.rgb * g.a * dim, g.a);
 }
