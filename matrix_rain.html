@@ -26,6 +26,76 @@
 	<body>
 		<canvas id="c"></canvas>
 		<script>
+			/* ──────────────────────────────────────────────────────────────────────────
+			 * MATRIX RAIN — model overview
+			 *
+			 * Stateless. Every fragment computes its colour from (col, row, time)
+			 * hashes. No buffers, no feedback textures, no JS-side simulation.
+			 *
+			 * Reference grounding. Parameters are tuned against close-up footage of
+			 * the original film effect on CRT screens. The reference frame had ~24
+			 * rows; we render at 54 rows (full screen height at 4K), with timing
+			 * scaled proportionally. Cells are slightly taller than wide (0.80
+			 * density) matching the original CRT aspect.
+			 *
+			 * Trails. Each column has an infinite Poisson-ish schedule of trails.
+			 * Trail k in column c starts at Tk = k * TRAIL_GAP_MEAN - colPhase(c)
+			 * + jitter(c, k). Head descends at TRAIL_SPEED cells/sec. trailRole()
+			 * walks back through recent trails to find which one owns a cell and
+			 * what role it plays: dead, eviction zone, head, body, or tail-fade.
+			 * Newer trails' eviction zones wipe older trails' bodies. Eviction
+			 * grows from 1 cell at trail arrival up to EVICT_LEN — avoids
+			 * snapping a wide blank band into existence.
+			 *
+			 * Mutation. Every trail cell mutates at MUTATE_HZ (2 Hz). Per-cell
+			 * phase staggering means cells never tick in unison. New glyph
+			 * crossfades over old over CROSSFADE_TIME — phosphor-not-yet-decayed
+			 * feel during the swap.
+			 *
+			 * Flash (two systems, max-combined):
+			 *   - Head-arrival flash. Each cell flashes when the head first lands
+			 *     on it. Decays continuously, so the cell immediately behind the
+			 *     head inherits a partially-decayed flash rather than snapping to
+			 *     baseline green. White → cyan → green ramp.
+			 *   - Body map-gated flash. A scrolling per-cell hash gates whether
+			 *     each body mutation flashes. Each cell holds its flash decision
+			 *     stable for ~3s before re-rolling, with per-cell phase so the
+			 *     re-roll moments are scattered. Blown-out green ramp, driven
+			 *     into the bloom for phosphor-burn highlights.
+			 *
+			 * Dark field. Same map sample as the body flash gate, opposite end of
+			 * [0,1]. Cells in the dim window darken instead of brightening on
+			 * mutation. One hash drives both effects; the gates partition the
+			 * map's value range.
+			 *
+			 * Layers. Two depth planes: foreground (depth 1.0) and background
+			 * (depth 0.6 with BG_TRAIL_SCALE shorter trails). Composited
+			 * foreground-over-background by alpha.
+			 *
+			 * Post-processing. Single-pass cross-kernel bloom — sceneAt() is
+			 * called 5x (centre + 4 cross neighbours), weighted by luminance²
+			 * so dim cells barely contribute. Then scanline + vertical mask.
+			 *
+			 * Breathing. Slow zoom oscillating in [1.0, 1.0+BREATHE_SCALE] — the
+			 * minimum is the natural viewport, so breathing only zooms IN and
+			 * never reveals content outside the natural screen extents.
+			 *
+			 * Per-cell stable variance. Body cells multiply by a stable per-cell
+			 * hash in [1-BODY_BRIGHT_VAR, 1] to break the "every body cell is
+			 * the same green" uniformity. Doesn't change over time.
+			 *
+			 * Resolution independence. Cell size derives from canvas height
+			 * (REF_CELL pixels at REF_HEIGHT). All trail geometry is expressed
+			 * in cells and seconds, never pixels. Bloom radius scales with
+			 * resolution so cell-relative bleed is consistent. Column count
+			 * scales naturally with aspect ratio.
+			 *
+			 * Tuning hotspots: TRAIL_GAP_MEAN/VAR (column density and burstiness),
+			 * FLASH_PROB / DARK_PROB (body flash/dim fraction), FLASH_BOOST and
+			 * FLASH_BOOST_TAIL (flash brightness, drive bloom), BLOOM_STRENGTH
+			 * (phosphor halo intensity), COL_DENSITY (horizontal column packing).
+			 * ──────────────────────────────────────────────────────────────────────── */
+
 			const canvas = document.getElementById("c");
 			const gl = canvas.getContext("webgl2");
 			if (!gl) {
@@ -72,7 +142,7 @@
 				// Blank slots — when a mutation lands on one of these, the cell renders empty,
 				// creating gaps in the column. The film reference is sparse, so we want a
 				// meaningful share. BLANK_FRACTION = fraction of final atlas that is blank.
-				const BLANK_FRACTION = 0.25;
+				const BLANK_FRACTION = 0.3;
 				const blankCount = Math.round((glyphs.length * BLANK_FRACTION) / (1 - BLANK_FRACTION));
 				for (let i = 0; i < blankCount; i++) glyphs.push({ ch: " ", mirror: false });
 
@@ -150,10 +220,10 @@ out vec4 fragColor;
 // At 4K (2160 tall): cellH = 40, cellW = 40 * COL_DENSITY, giving 54 rows.
 // At 1080p: cellH = 20, still 54 rows. Column count derives from
 // canvas width / cellW, so ultrawide displays naturally get more columns.
-#define REF_CELL          40.0    // reference cell size in pixels at REF_HEIGHT (vertical)
+#define REF_CELL          32.0    // reference cell size in pixels at REF_HEIGHT (vertical)
 #define REF_HEIGHT        2160.0  // reference canvas height in pixels (4K)
-#define COL_DENSITY       0.8    // horizontal column spacing as fraction of vertical cell size — <1.0 packs columns tighter; glyphs render slightly compressed but Katakana/digits handle this fine
-#define COLOR             vec3(0.2, 1.0, 0.50) // base RGB colour of the rain — tint the whole effect here
+#define COL_DENSITY       0.80    // horizontal column spacing as fraction of vertical cell size — glyphs render taller than wide, matching the original CRT aesthetic where pixels were often non-square
+#define COLOR             vec3(0.2, 1.0, 0.45) // base RGB colour of the rain — tint the whole effect here
 
 // --- Trail geometry (foreground layer) --------------------------------------
 // Trails are discrete: a contiguous run of cells that scrolls down a column.
@@ -185,7 +255,7 @@ out vec4 fragColor;
 // roughly equals traversal time, meaning ~1 trail alive per column on
 // average. Our 54-row screen takes 9s to traverse, so gap is scaled
 // proportionally: 9s mean, ~6.5s variance.
-#define TRAIL_SPEED       6.0     // cells per second downward — 1 cell per 5 frames at 30fps
+#define TRAIL_SPEED       6.5     // cells per second downward — 1 cell per 5 frames at 30fps
 #define TRAIL_GAP_MEAN    24.0     // mean seconds between trail arrivals in a single column
 #define TRAIL_GAP_VAR     9.5     // gap variance — higher = more bursty
 #define TRAIL_LOOKBACK    5       // how many recent trails to test per fragment
@@ -193,7 +263,7 @@ out vec4 fragColor;
 // --- Glyph mutation model ----------------------------------------------------
 // Every body/fade/head cell mutates at MUTATE_HZ with per-cell phase
 // staggering. No per-column flicker boost — uniform rate across the screen.
-#define MUTATE_HZ           1.1    // mutation rate inside trail in Hz
+#define MUTATE_HZ           0.8    // mutation rate inside trail in Hz
 
 // --- Mutation flash & crossfade ---------------------------------------------
 // New glyphs crossfade over old over CROSSFADE_TIME. Mutations flash white
@@ -203,11 +273,11 @@ out vec4 fragColor;
 #define FLASH_HEAD_DECAY    0.35   // head flash decay in seconds — slower than tail
 #define FLASH_PROB          0.12   // fraction of tail mutations that flash
 #define FLASH_MAP_SCROLL    0.25  // flash map vertical scroll in cells/sec — 1 cell per 3s
-#define FLASH_BOOST         2.5    // brightness multiplier at head flash peak
-#define FLASH_BOOST_TAIL    1.4    // brightness multiplier at tail flash peak — was 1.8 when sharing head ramp; raised now that body flashes have their own blown-green ramp
-#define FLASH_COLOUR_HOT    vec3(1.0, 1.0, 1.0)
+#define FLASH_BOOST         2.3    // brightness multiplier at head flash peak
+#define FLASH_BOOST_TAIL    1.6    // brightness multiplier at tail flash peak — was 1.8 when sharing head ramp; raised now that body flashes have their own blown-green ramp
+#define FLASH_COLOUR_HOT    vec3(0.8, 1.0, 0.8)
 #define FLASH_COLOUR_MID    vec3(0.55, 1.0, 0.95)
-#define FLASH_BODY_HOT      vec3(0.55, 1.0, 0.75)   // body flash peak — blown-out matrix green for phosphor burn through bloom
+#define FLASH_BODY_HOT      vec3(0.65, 1.2, 0.45)   // body flash peak — blown-out matrix green for phosphor burn through bloom
 
 // --- Dark field --------------------------------------------------------------
 // Inverse of the flash gate, sampled from the *same* mapSample so a single
@@ -217,7 +287,7 @@ out vec4 fragColor;
 // bucket as flashes and decay similarly.
 #define DARK_PROB           0.12   // fraction of tail mutations that dim
 #define DARK_DECAY          0.40   // dim decay in seconds — keep close to FLASH_DECAY for visual parity
-#define DARK_DEPTH          0.65   // brightness multiplier at peak dim — 0 = black, 1 = no effect
+#define DARK_DEPTH          0.45   // brightness multiplier at peak dim — 0 = black, 1 = no effect
 
 // --- Body brightness variance ------------------------------------------------
 // Per-cell stable brightness multiplier applied to body cells. Breaks up the
@@ -238,20 +308,27 @@ out vec4 fragColor;
 // Two layers now: foreground (depth 1.0) and background (depth 0.6).
 // Background uses smaller cells so trails read as further away. Per request,
 // background trails are shorter to enhance depth.
-#define BG_DEPTH          0.6     // background layer depth — controls cell size and dim
-#define BG_TRAIL_SCALE    0.55    // background trail length as fraction of foreground trail (in cells of the bg layer)
+#define BG_DEPTH          0.575     // background layer depth — controls cell size and dim
+#define BG_TRAIL_SCALE    0.55     // background trail length as fraction of foreground trail (in cells of the bg layer)
 
 // --- CRT / scanline / breathing ---------------------------------------------
 #define SCANLINE_DARK     0.45
 #define SCANLINE_SWING    0.5
 #define SCANLINE_SCALE    0.45
-#define BREATHE_SCALE     0.14
-#define BREATHE_SPEED     0.12
+#define BREATHE_SCALE     0.65
+#define BREATHE_SPEED     0.08
 #define ATLAS_COLS        32.0
 
 vec2 breathe(vec2 fragCoord) {
   vec2 centre = iResolution.xy * 0.5;
-  float scale = 1.0 + BREATHE_SCALE * sin(iTime * BREATHE_SPEED);
+  // Midpoint-shifted so scale ranges in [1.0, 1.0 + BREATHE_SCALE]. The
+  // minimum (and resting "natural" view) corresponds to scale = 1.0, so
+  // breathing only zooms *in* and never reveals content outside the
+  // natural viewport.
+  //float scale = 1.0 + BREATHE_SCALE * 0.5 + BREATHE_SCALE * 0.5 * sin(iTime * BREATHE_SPEED);
+  float k = 1.1; // try 1.0–2.5
+float s = tanh(k * sin(iTime * BREATHE_SPEED)) / tanh(k);
+float scale = 1.0 + BREATHE_SCALE * 0.5 + BREATHE_SCALE * 0.5 * s;
   return (fragCoord - centre) / scale + centre;
 }
 
@@ -320,8 +397,13 @@ vec4 trailRole(float colIdx, float row, float t, float trailLenScale) {
     // Distance from this fragment's row to the head (positive = below head).
     float distToHead = row - headRow;
 
-    // Eviction zone: distToHead in (0, EVICT_LEN]
-    if (distToHead > 0.0 && distToHead <= EVICT_LEN) {
+    // Eviction zone: distToHead in (0, evictReach]. evictReach grows from
+    // 0 at trail arrival up to EVICT_LEN as the head descends — avoids
+    // snapping the full eviction band into existence at the moment a new
+    // trail starts (which would wipe a chunk of the previous trail's body
+    // instantaneously).
+    float evictReach = min(EVICT_LEN, headRow);
+    if (distToHead > 0.0 && distToHead <= evictReach) {
       evictHit = 1.0;
     }
     // Head: distToHead == 0
