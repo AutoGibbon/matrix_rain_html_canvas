@@ -262,8 +262,16 @@ out vec4 fragColor;
 
 // --- Glyph mutation model ----------------------------------------------------
 // Every body/fade/head cell mutates at MUTATE_HZ with per-cell phase
-// staggering. No per-column flicker boost — uniform rate across the screen.
-#define MUTATE_HZ           0.8    // mutation rate inside trail in Hz
+// staggering and banded rate jitter. Jitter is gated: cells whose hash
+// magnitude falls below MUTATE_JITTER_THRESHOLD run at exactly the base
+// rate; only the tail-end cells past the threshold deviate. This gives
+// a tight central cluster of normal-rate cells with a sparse minority
+// of visibly fast/slow outliers, rather than smooth variation across
+// the whole field.
+#define MUTATE_HZ                0.95   // mutation rate inside trail in Hz
+#define MUTATE_JITTER            0.85   // outlier rate variance, fraction of MUTATE_HZ
+#define MUTATE_JITTER_THRESHOLD  0.7    // |hash| below this = no jitter; above = outlier
+#define MUTATE_JITTER_BIAS       0.3    // push toward extreme jitters
 
 // --- Mutation flash & crossfade ---------------------------------------------
 // New glyphs crossfade over old over CROSSFADE_TIME. Mutations flash white
@@ -325,10 +333,8 @@ vec2 breathe(vec2 fragCoord) {
   // minimum (and resting "natural" view) corresponds to scale = 1.0, so
   // breathing only zooms *in* and never reveals content outside the
   // natural viewport.
-  //float scale = 1.0 + BREATHE_SCALE * 0.5 + BREATHE_SCALE * 0.5 * sin(iTime * BREATHE_SPEED);
-  float k = 1.1; // try 1.0–2.5
-float s = tanh(k * sin(iTime * BREATHE_SPEED)) / tanh(k);
-float scale = 1.0 + BREATHE_SCALE * 0.5 + BREATHE_SCALE * 0.5 * s;
+  float scale = 1.0 + BREATHE_SCALE * 0.5 + BREATHE_SCALE * 0.5 * sin(iTime * BREATHE_SPEED);
+
   return (fragCoord - centre) / scale + centre;
 }
 
@@ -474,10 +480,24 @@ vec4 glyph(float colIdx, float localX, float fragY, float cellW, float cellH, fl
   float fadeAlpha  = role.z;
   float Tk         = role.w;
 
-  // Single global mutation rate — no per-column flicker, no head-zone boost.
-  // Heads still always flash (see flashGate below); they just do not mutate
-  // any faster than body cells.
-  float mutateHz = MUTATE_HZ;
+  // Per-cell mutation rate — banded jitter. Hash maps to a signed value
+  // in [-1, +1]; only cells past the threshold get any deviation from
+  // the base rate, and the deviation ramps from zero at the threshold
+  // up to ±MUTATE_JITTER at the extremes. Result: most cells sit on
+  // MUTATE_HZ exactly, a sparse minority are visibly faster or slower
+  // outliers. Sign of the hash determines fast/slow. Heads still always
+  // flash (see flashGate below); they just do not mutate any faster
+  // than body cells.
+  float rawHash    = hash21(cell + 29.0) * 2.0 - 1.0;            // [-1, +1]
+  // Bias toward extremes: cube preserves sign and pulls mid-values outward.
+  // pow > 1 = compress toward 0 (fewer outliers), pow < 1 = pull toward ±1 (more outliers)
+  float jitterHash = sign(rawHash) * pow(abs(rawHash), MUTATE_JITTER_BIAS);
+  float jitterMag  = abs(jitterHash);
+  float jitterSign = sign(jitterHash);
+  float jitterAmount = max(jitterMag - MUTATE_JITTER_THRESHOLD, 0.0)
+                     / max(1.0 - MUTATE_JITTER_THRESHOLD, 0.0001); // [0, 1] past threshold
+  float rateJitter   = jitterSign * jitterAmount * MUTATE_JITTER;
+  float mutateHz     = MUTATE_HZ * (1.0 + rateJitter);
 
   // Per-cell phase, mutation bucket
   float phase  = hash21(cell + 13.0);
